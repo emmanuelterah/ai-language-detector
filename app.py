@@ -1,4 +1,5 @@
 import streamlit as st
+import yt_dlp
 import os
 import cv2
 import speech_recognition as sr
@@ -8,87 +9,58 @@ from collections import Counter
 from pydub import AudioSegment
 import subprocess
 import shutil
-import soundfile as sf
-from scipy import signal
-from scipy.fft import fft
-import matplotlib.pyplot as plt
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+import torch
+import torch.nn.functional as F
+import nest_asyncio
+from functools import lru_cache
 from pytube import YouTube
+import re
+
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
 
 # Create a directory for downloads and analysis
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work')
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# Define accent patterns
-ACCENT_PATTERNS = {
-    "British English": {
-        "vocabulary": [
-            "colour", "favour", "centre", "theatre", "realise", "organise",
-            "analyse", "catalogue", "dialogue", "programme", "cheque",
-            "plough", "mould", "moult", "smoulder", "moustache", "storey",
-            "grey", "jewellery", "marvellous", "travelling", "counsellor",
-            "counselling", "signalling", "cancelling", "modelling", "traveller"
-        ],
-        "phrases": [
-            "shall we", "whilst", "amongst", "whilst", "amongst",
-            "have got", "haven't got", "hasn't got", "hadn't got"
-        ]
-    },
-    "American English": {
-        "vocabulary": [
-            "color", "favor", "center", "theater", "realize", "organize",
-            "analyze", "catalog", "dialog", "program", "check",
-            "plow", "mold", "molt", "smolder", "mustache", "story",
-            "gray", "jewelry", "marvelous", "traveling", "counselor",
-            "counseling", "signaling", "canceling", "modeling", "traveler"
-        ],
-        "phrases": [
-            "gotten", "fall", "garbage", "elevator", "apartment", "sidewalk",
-            "truck", "trunk", "hood", "windshield", "gas", "parking lot"
-        ]
-    },
-    "Australian English": {
-        "vocabulary": [
-            "mate", "gday", "barbie", "arvo", "brekkie", "bloke",
-            "crikey", "drongo", "fair dinkum", "good on ya", "no worries",
-            "sheila", "strewth", "ta", "tucker", "ute", "wowser"
-        ],
-        "phrases": [
-            "no worries", "good on ya", "fair dinkum", "she'll be right",
-            "no worries", "good on ya", "fair dinkum", "she'll be right"
-        ]
-    },
-    "Indian English": {
-        "vocabulary": [
-            "prepone", "do the needful", "kindly revert", "out of station",
-            "pass out", "timepass", "batchmate", "co-brother", "cousin-brother",
-            "cousin-sister", "co-sister", "co-brother", "co-sister"
-        ],
-        "phrases": [
-            "do the needful", "kindly revert", "out of station",
-            "pass out", "timepass", "batchmate"
-        ]
-    },
-    "African English": {
-        "vocabulary": [
-            "chop", "mammy", "pikin", "wahala", "bros", "sista",
-            "oga", "madam", "bros", "sista", "oga", "madam"
-        ],
-        "phrases": [
-            "how far", "no wahala", "well done", "thank you",
-            "how far", "no wahala", "well done"
-        ]
-    },
-    "Caribbean English": {
-        "vocabulary": [
-            "irie", "yaad", "ting", "bredren", "sistren", "lime",
-            "brawta", "dutty", "fyah", "irie", "yaad", "ting"
-        ],
-        "phrases": [
-            "no problem", "irie", "yaad", "ting", "bredren",
-            "sistren", "lime", "brawta"
-        ]
-    }
+# Global state for model
+MODEL_STATE = {
+    'classifier': None,
+    'initialized': False
 }
+
+def initialize_model():
+    """Initialize the model outside of Streamlit's context"""
+    if not MODEL_STATE['initialized']:
+        try:
+            # Load model and tokenizer separately
+            model_name = "facebook/bart-large-mnli"
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForSequenceClassification.from_pretrained(model_name)
+            
+            # Create pipeline with explicit components
+            MODEL_STATE['classifier'] = pipeline(
+                "zero-shot-classification",
+                model=model,
+                tokenizer=tokenizer,
+                device=0 if torch.cuda.is_available() else -1,
+                framework="pt"
+            )
+            MODEL_STATE['initialized'] = True
+        except Exception as e:
+            print(f"Error initializing model: {str(e)}")
+            MODEL_STATE['initialized'] = False
+
+# Initialize model at module level
+initialize_model()
+
+@st.cache_resource
+def get_classifier():
+    """Get the classifier from global state"""
+    if not MODEL_STATE['initialized']:
+        initialize_model()
+    return MODEL_STATE['classifier']
 
 def cleanup_work_dir():
     """Clean up the work directory"""
@@ -108,26 +80,77 @@ def check_ffmpeg():
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
+def is_youtube_url(url):
+    """Check if the URL is a YouTube URL"""
+    youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+    return bool(re.match(youtube_regex, url))
+
+def download_with_pytube(url):
+    """Download video using pytube"""
+    try:
+        yt = YouTube(url)
+        # Get the audio stream
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        if not audio_stream:
+            raise Exception("No audio stream found")
+            
+        # Download to a temporary file
+        temp_path = os.path.join(WORK_DIR, f"audio_{int(np.random.random() * 1000000)}.mp4")
+        audio_stream.download(output_path=WORK_DIR, filename=os.path.basename(temp_path))
+        
+        return temp_path
+    except Exception as e:
+        print(f"Pytube download failed: {str(e)}")
+        return None
+
 def download_video(url):
     """Download video from URL and return the local path"""
     # Clean up any existing files
     cleanup_work_dir()
     
     # Create a unique filename
-    temp_path = os.path.join(WORK_DIR, f"audio_{int(np.random.random() * 1000000)}.mp4")
+    temp_path = os.path.join(WORK_DIR, f"audio_{int(np.random.random() * 1000000)}.webm")
     
     try:
-        # Create YouTube object
-        yt = YouTube(url)
+        # Try pytube first for YouTube URLs
+        if is_youtube_url(url):
+            downloaded_path = download_with_pytube(url)
+            if downloaded_path and os.path.exists(downloaded_path):
+                return downloaded_path
         
-        # Get the audio stream
-        audio_stream = yt.streams.filter(only_audio=True).first()
+        # Fallback to yt-dlp for non-YouTube URLs or if pytube fails
+        ydl_opts = {
+            'format': 'bestaudio[ext=webm]/bestaudio/best',
+            'outtmpl': temp_path,
+            'quiet': False,
+            'no_warnings': False,
+            'extract_flat': False,
+            'force_generic_extractor': False,
+            'verbose': True,
+            'ignoreerrors': True,
+            'no_check_certificate': True,
+            'prefer_insecure': True,
+            'keepvideo': True,
+            'writethumbnail': False,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'skip_download': False,
+            'noplaylist': True,
+            'nocheckcertificate': True,
+            'ignoreerrors': True,
+            'no_warnings': False,
+            'quiet': False,
+            'verbose': True
+        }
         
-        if not audio_stream:
-            raise Exception("No audio stream found")
-        
-        # Download the audio
-        audio_stream.download(output_path=WORK_DIR, filename=os.path.basename(temp_path))
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # First, try to get video info
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                raise Exception("Could not extract video information")
+            
+            # Download the video
+            ydl.download([url])
         
         # Verify the downloaded file
         if not os.path.exists(temp_path):
@@ -189,78 +212,8 @@ def transcribe_audio(audio_path):
             st.error(f"Error in transcription: {str(e)}")
             return None
 
-def extract_audio_features(audio_path):
-    """Extract phonetic features from audio"""
-    try:
-        # Load audio file
-        data, samplerate = sf.read(audio_path)
-        
-        # Convert to mono if stereo
-        if len(data.shape) > 1:
-            data = np.mean(data, axis=1)
-        
-        # Extract features
-        features = {}
-        
-        # 1. Basic audio features
-        features['rms'] = np.sqrt(np.mean(data**2))  # Root mean square
-        features['zero_crossings'] = np.sum(np.diff(np.signbit(data)))  # Zero crossing rate
-        
-        # 2. Spectral features
-        spectrum = np.abs(fft(data))
-        freqs = np.fft.fftfreq(len(data), 1/samplerate)
-        
-        # Get positive frequencies only
-        pos_freq_mask = freqs > 0
-        freqs = freqs[pos_freq_mask]
-        spectrum = spectrum[pos_freq_mask]
-        
-        # Spectral centroid
-        features['spectral_centroid'] = np.sum(freqs * spectrum) / np.sum(spectrum)
-        
-        # Spectral bandwidth
-        features['spectral_bandwidth'] = np.sqrt(np.sum((freqs - features['spectral_centroid'])**2 * spectrum) / np.sum(spectrum))
-        
-        # 3. Pitch detection using autocorrelation
-        def get_pitch(data, sr):
-            # Compute autocorrelation
-            corr = signal.correlate(data, data, mode='full')
-            corr = corr[len(corr)//2:]
-            
-            # Find peaks
-            peaks = signal.find_peaks(corr)[0]
-            if len(peaks) > 0:
-                # Get the first peak after the first zero crossing
-                zero_crossings = np.where(np.diff(np.signbit(corr)))[0]
-                if len(zero_crossings) > 0:
-                    valid_peaks = peaks[peaks > zero_crossings[0]]
-                    if len(valid_peaks) > 0:
-                        return sr / valid_peaks[0]
-            return 0
-        
-        features['pitch'] = get_pitch(data, samplerate)
-        
-        # 4. Rhythm features
-        # Compute onset strength
-        onset_env = np.diff(np.abs(data))
-        features['onset_strength'] = np.mean(onset_env)
-        
-        # Estimate tempo
-        autocorr = signal.correlate(onset_env, onset_env, mode='full')
-        autocorr = autocorr[len(autocorr)//2:]
-        peaks = signal.find_peaks(autocorr)[0]
-        if len(peaks) > 0:
-            features['tempo'] = 60 * samplerate / peaks[0]
-        else:
-            features['tempo'] = 0
-        
-        return features
-    except Exception as e:
-        st.error(f"Error extracting audio features: {str(e)}")
-        return None
-
-def analyze_accent(audio_path, text):
-    """Analyze accent using phonetic features and text analysis"""
+def analyze_accent(text):
+    """Analyze accent using machine learning model"""
     if not text:
         return {
             'accent': 'Unknown',
@@ -268,141 +221,60 @@ def analyze_accent(audio_path, text):
             'explanation': 'No text provided for analysis'
         }
     
-    try:
-        # Extract audio features
-        features = extract_audio_features(audio_path)
-        if not features:
-            return {
-                'accent': 'Error',
-                'confidence': 0,
-                'explanation': 'Failed to extract audio features'
-            }
-        
-        # Define accent characteristics based on phonetic research
-        accent_characteristics = {
-            "British English": {
-                "pitch_range": (180, 220),  # Hz
-                "tempo_range": (120, 140),  # BPM
-                "spectral_centroid_range": (2000, 2500),  # Hz
-                "onset_strength_range": (0.1, 0.3)
-            },
-            "American English": {
-                "pitch_range": (200, 240),  # Hz
-                "tempo_range": (130, 150),  # BPM
-                "spectral_centroid_range": (2200, 2700),  # Hz
-                "onset_strength_range": (0.2, 0.4)
-            },
-            "Australian English": {
-                "pitch_range": (190, 230),  # Hz
-                "tempo_range": (125, 145),  # BPM
-                "spectral_centroid_range": (2100, 2600),  # Hz
-                "onset_strength_range": (0.15, 0.35)
-            },
-            "Indian English": {
-                "pitch_range": (170, 210),  # Hz
-                "tempo_range": (115, 135),  # BPM
-                "spectral_centroid_range": (1900, 2400),  # Hz
-                "onset_strength_range": (0.1, 0.3)
-            },
-            "African English": {
-                "pitch_range": (160, 200),  # Hz
-                "tempo_range": (110, 130),  # BPM
-                "spectral_centroid_range": (1800, 2300),  # Hz
-                "onset_strength_range": (0.1, 0.3)
-            },
-            "Caribbean English": {
-                "pitch_range": (175, 215),  # Hz
-                "tempo_range": (118, 138),  # BPM
-                "spectral_centroid_range": (1950, 2450),  # Hz
-                "onset_strength_range": (0.15, 0.35)
-            }
+    # Get the classifier from global state
+    classifier = get_classifier()
+    if not classifier:
+        return {
+            'accent': 'Error',
+            'confidence': 0,
+            'explanation': 'Failed to load accent classifier'
         }
-        
-        # Calculate scores for each accent
-        scores = {}
-        for accent, characteristics in accent_characteristics.items():
-            score = 0
-            total_features = 0
-            
-            # Check pitch
-            if 'pitch' in features:
-                pitch = features['pitch']
-                if characteristics['pitch_range'][0] <= pitch <= characteristics['pitch_range'][1]:
-                    score += 1
-                total_features += 1
-            
-            # Check tempo
-            if 'tempo' in features:
-                tempo = features['tempo']
-                if characteristics['tempo_range'][0] <= tempo <= characteristics['tempo_range'][1]:
-                    score += 1
-                total_features += 1
-            
-            # Check spectral centroid
-            if 'spectral_centroid' in features:
-                centroid = features['spectral_centroid']
-                if characteristics['spectral_centroid_range'][0] <= centroid <= characteristics['spectral_centroid_range'][1]:
-                    score += 1
-                total_features += 1
-            
-            # Check onset strength
-            if 'onset_strength' in features:
-                onset = features['onset_strength']
-                if characteristics['onset_strength_range'][0] <= onset <= characteristics['onset_strength_range'][1]:
-                    score += 1
-                total_features += 1
-            
-            # Calculate final score
-            if total_features > 0:
-                scores[accent] = (score / total_features) * 100
+    
+    # Define accent categories with their characteristics
+    accent_categories = [
+        "British English accent with formal vocabulary and traditional expressions",
+        "American English accent with casual vocabulary and modern expressions",
+        "Australian English accent with colloquial vocabulary and informal expressions",
+        "Indian English accent with unique vocabulary and grammar patterns",
+        "African English accent with distinctive vocabulary and speech patterns",
+        "Caribbean English accent with unique vocabulary and rhythm"
+    ]
+    
+    try:
+        # Perform zero-shot classification
+        result = classifier(
+            text,
+            accent_categories,
+            multi_label=False
+        )
         
         # Get the best match
-        if scores:
-            best_accent = max(scores.items(), key=lambda x: x[1])
-            accent, confidence = best_accent
-            
-            # Generate explanation
-            explanation = f"Detected {accent} with {confidence:.1f}% confidence. "
-            
-            # Add specific observations based on the phonetic features
-            if features['pitch'] < 190:
-                explanation += "The speech shows lower pitch characteristics typical of "
-                if "African" in accent:
-                    explanation += "African English patterns. "
-                elif "Indian" in accent:
-                    explanation += "Indian English patterns. "
-            elif features['pitch'] > 220:
-                explanation += "The speech shows higher pitch characteristics typical of "
-                if "American" in accent:
-                    explanation += "American English patterns. "
-                elif "Australian" in accent:
-                    explanation += "Australian English patterns. "
-            
-            if features['tempo'] < 125:
-                explanation += "The speech rhythm is more measured and deliberate, "
-                if "British" in accent:
-                    explanation += "characteristic of British English. "
-                elif "Indian" in accent:
-                    explanation += "characteristic of Indian English. "
-            elif features['tempo'] > 140:
-                explanation += "The speech rhythm is more rapid and fluid, "
-                if "American" in accent:
-                    explanation += "characteristic of American English. "
-                elif "Australian" in accent:
-                    explanation += "characteristic of Australian English. "
-            
-            return {
-                'accent': accent,
-                'confidence': confidence,
-                'explanation': explanation
-            }
-        else:
-            return {
-                'accent': 'Unknown',
-                'confidence': 0,
-                'explanation': 'Could not determine accent from audio features'
-            }
-            
+        best_match_idx = result['labels'].index(result['labels'][0])
+        confidence = result['scores'][0] * 100
+        
+        # Generate explanation based on the detected accent
+        accent = result['labels'][0]
+        explanation = f"Detected {accent} with {confidence:.1f}% confidence. "
+        
+        # Add specific observations based on the accent
+        if "British" in accent:
+            explanation += "The text shows characteristics of British English, including formal vocabulary and traditional expressions."
+        elif "American" in accent:
+            explanation += "The text shows characteristics of American English, including casual vocabulary and modern expressions."
+        elif "Australian" in accent:
+            explanation += "The text shows characteristics of Australian English, including colloquial vocabulary and informal expressions."
+        elif "Indian" in accent:
+            explanation += "The text shows characteristics of Indian English, including unique vocabulary and grammar patterns."
+        elif "African" in accent:
+            explanation += "The text shows characteristics of African English, including distinctive vocabulary and speech patterns."
+        elif "Caribbean" in accent:
+            explanation += "The text shows characteristics of Caribbean English, including unique vocabulary and rhythm."
+        
+        return {
+            'accent': accent,
+            'confidence': confidence,
+            'explanation': explanation
+        }
     except Exception as e:
         return {
             'accent': 'Error',
@@ -441,22 +313,12 @@ def main():
                         st.write("Transcribed Text:", text)
                         
                         # Analyze accent
-                        result = analyze_accent(audio_path, text)
+                        result = analyze_accent(text)
                         
                         # Display results
                         st.success(f"Detected Accent: {result['accent']}")
                         st.info(f"Confidence: {result['confidence']:.1f}%")
                         st.write(result['explanation'])
-                        
-                        # Display audio waveform
-                        st.subheader("Audio Analysis")
-                        data, samplerate = sf.read(audio_path)
-                        if len(data.shape) > 1:
-                            data = np.mean(data, axis=1)
-                        plt.figure(figsize=(10, 3))
-                        plt.plot(data)
-                        plt.title("Audio Waveform")
-                        st.pyplot(plt)
                     
                     # Cleanup
                     cleanup_work_dir()
