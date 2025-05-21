@@ -1,5 +1,4 @@
 import streamlit as st
-import yt_dlp
 import os
 import cv2
 import speech_recognition as sr
@@ -13,6 +12,7 @@ import soundfile as sf
 from scipy import signal
 from scipy.fft import fft
 import matplotlib.pyplot as plt
+from pytube import YouTube
 
 # Create a directory for downloads and analysis
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work')
@@ -114,48 +114,20 @@ def download_video(url):
     cleanup_work_dir()
     
     # Create a unique filename
-    temp_path = os.path.join(WORK_DIR, f"audio_{int(np.random.random() * 1000000)}.webm")
-    
-    ydl_opts = {
-        'format': 'bestaudio[ext=webm]/bestaudio/best',
-        'outtmpl': temp_path,
-        'quiet': False,
-        'no_warnings': False,
-        'extract_flat': False,
-        'force_generic_extractor': False,
-        'verbose': True,
-        'ignoreerrors': True,
-        'no_check_certificate': True,
-        'prefer_insecure': True,
-        'keepvideo': True,
-        'writethumbnail': False,
-        'writesubtitles': False,
-        'writeautomaticsub': False,
-        'skip_download': False,
-        'noplaylist': True,
-        'nocheckcertificate': True,
-        'ignoreerrors': True,
-        'no_warnings': False,
-        'quiet': False,
-        'verbose': True,
-        # Use a custom user agent
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate'
-        }
-    }
+    temp_path = os.path.join(WORK_DIR, f"audio_{int(np.random.random() * 1000000)}.mp4")
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # First, try to get video info
-            info = ydl.extract_info(url, download=False)
-            if not info:
-                raise Exception("Could not extract video information")
-            
-            # Download the video
-            ydl.download([url])
+        # Create YouTube object
+        yt = YouTube(url)
+        
+        # Get the audio stream
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        
+        if not audio_stream:
+            raise Exception("No audio stream found")
+        
+        # Download the audio
+        audio_stream.download(output_path=WORK_DIR, filename=os.path.basename(temp_path))
         
         # Verify the downloaded file
         if not os.path.exists(temp_path):
