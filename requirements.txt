@@ -1,0 +1,8 @@
+yt-dlp
+opencv-python
+SpeechRecognition
+streamlit
+numpy
+pydub
+transformers
+torch
