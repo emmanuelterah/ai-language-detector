@@ -4,5 +4,6 @@ SpeechRecognition
 streamlit
 numpy
 pydub
-transformers
-torch
+soundfile
+scipy
+matplotlib

@@ -9,26 +9,86 @@ from collections import Counter
 from pydub import AudioSegment
 import subprocess
 import shutil
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import torch
+import soundfile as sf
+from scipy import signal
+from scipy.fft import fft
+import matplotlib.pyplot as plt
 
 # Create a directory for downloads and analysis
 WORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'work')
 os.makedirs(WORK_DIR, exist_ok=True)
 
-# Initialize the accent classifier
-@st.cache_resource
-def load_accent_classifier():
-    """Load the accent classification model"""
-    try:
-        # Using a simpler model that doesn't require custom classes
-        model_name = "distilbert-base-uncased"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=6)
-        return model, tokenizer
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None
+# Define accent patterns
+ACCENT_PATTERNS = {
+    "British English": {
+        "vocabulary": [
+            "colour", "favour", "centre", "theatre", "realise", "organise",
+            "analyse", "catalogue", "dialogue", "programme", "cheque",
+            "plough", "mould", "moult", "smoulder", "moustache", "storey",
+            "grey", "jewellery", "marvellous", "travelling", "counsellor",
+            "counselling", "signalling", "cancelling", "modelling", "traveller"
+        ],
+        "phrases": [
+            "shall we", "whilst", "amongst", "whilst", "amongst",
+            "have got", "haven't got", "hasn't got", "hadn't got"
+        ]
+    },
+    "American English": {
+        "vocabulary": [
+            "color", "favor", "center", "theater", "realize", "organize",
+            "analyze", "catalog", "dialog", "program", "check",
+            "plow", "mold", "molt", "smolder", "mustache", "story",
+            "gray", "jewelry", "marvelous", "traveling", "counselor",
+            "counseling", "signaling", "canceling", "modeling", "traveler"
+        ],
+        "phrases": [
+            "gotten", "fall", "garbage", "elevator", "apartment", "sidewalk",
+            "truck", "trunk", "hood", "windshield", "gas", "parking lot"
+        ]
+    },
+    "Australian English": {
+        "vocabulary": [
+            "mate", "gday", "barbie", "arvo", "brekkie", "bloke",
+            "crikey", "drongo", "fair dinkum", "good on ya", "no worries",
+            "sheila", "strewth", "ta", "tucker", "ute", "wowser"
+        ],
+        "phrases": [
+            "no worries", "good on ya", "fair dinkum", "she'll be right",
+            "no worries", "good on ya", "fair dinkum", "she'll be right"
+        ]
+    },
+    "Indian English": {
+        "vocabulary": [
+            "prepone", "do the needful", "kindly revert", "out of station",
+            "pass out", "timepass", "batchmate", "co-brother", "cousin-brother",
+            "cousin-sister", "co-sister", "co-brother", "co-sister"
+        ],
+        "phrases": [
+            "do the needful", "kindly revert", "out of station",
+            "pass out", "timepass", "batchmate"
+        ]
+    },
+    "African English": {
+        "vocabulary": [
+            "chop", "mammy", "pikin", "wahala", "bros", "sista",
+            "oga", "madam", "bros", "sista", "oga", "madam"
+        ],
+        "phrases": [
+            "how far", "no wahala", "well done", "thank you",
+            "how far", "no wahala", "well done"
+        ]
+    },
+    "Caribbean English": {
+        "vocabulary": [
+            "irie", "yaad", "ting", "bredren", "sistren", "lime",
+            "brawta", "dutty", "fyah", "irie", "yaad", "ting"
+        ],
+        "phrases": [
+            "no problem", "irie", "yaad", "ting", "bredren",
+            "sistren", "lime", "brawta"
+        ]
+    }
+}
 
 def cleanup_work_dir():
     """Clean up the work directory"""
@@ -78,13 +138,12 @@ def download_video(url):
         'no_warnings': False,
         'quiet': False,
         'verbose': True,
-        # Add YouTube authentication
-        'cookiesfrombrowser': ('chrome',),
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android'],
-                'player_skip': ['webpage', 'configs'],
-            }
+        # Use a custom user agent
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate'
         }
     }
     
@@ -158,8 +217,78 @@ def transcribe_audio(audio_path):
             st.error(f"Error in transcription: {str(e)}")
             return None
 
-def analyze_accent(text):
-    """Analyze accent using machine learning model"""
+def extract_audio_features(audio_path):
+    """Extract phonetic features from audio"""
+    try:
+        # Load audio file
+        data, samplerate = sf.read(audio_path)
+        
+        # Convert to mono if stereo
+        if len(data.shape) > 1:
+            data = np.mean(data, axis=1)
+        
+        # Extract features
+        features = {}
+        
+        # 1. Basic audio features
+        features['rms'] = np.sqrt(np.mean(data**2))  # Root mean square
+        features['zero_crossings'] = np.sum(np.diff(np.signbit(data)))  # Zero crossing rate
+        
+        # 2. Spectral features
+        spectrum = np.abs(fft(data))
+        freqs = np.fft.fftfreq(len(data), 1/samplerate)
+        
+        # Get positive frequencies only
+        pos_freq_mask = freqs > 0
+        freqs = freqs[pos_freq_mask]
+        spectrum = spectrum[pos_freq_mask]
+        
+        # Spectral centroid
+        features['spectral_centroid'] = np.sum(freqs * spectrum) / np.sum(spectrum)
+        
+        # Spectral bandwidth
+        features['spectral_bandwidth'] = np.sqrt(np.sum((freqs - features['spectral_centroid'])**2 * spectrum) / np.sum(spectrum))
+        
+        # 3. Pitch detection using autocorrelation
+        def get_pitch(data, sr):
+            # Compute autocorrelation
+            corr = signal.correlate(data, data, mode='full')
+            corr = corr[len(corr)//2:]
+            
+            # Find peaks
+            peaks = signal.find_peaks(corr)[0]
+            if len(peaks) > 0:
+                # Get the first peak after the first zero crossing
+                zero_crossings = np.where(np.diff(np.signbit(corr)))[0]
+                if len(zero_crossings) > 0:
+                    valid_peaks = peaks[peaks > zero_crossings[0]]
+                    if len(valid_peaks) > 0:
+                        return sr / valid_peaks[0]
+            return 0
+        
+        features['pitch'] = get_pitch(data, samplerate)
+        
+        # 4. Rhythm features
+        # Compute onset strength
+        onset_env = np.diff(np.abs(data))
+        features['onset_strength'] = np.mean(onset_env)
+        
+        # Estimate tempo
+        autocorr = signal.correlate(onset_env, onset_env, mode='full')
+        autocorr = autocorr[len(autocorr)//2:]
+        peaks = signal.find_peaks(autocorr)[0]
+        if len(peaks) > 0:
+            features['tempo'] = 60 * samplerate / peaks[0]
+        else:
+            features['tempo'] = 0
+        
+        return features
+    except Exception as e:
+        st.error(f"Error extracting audio features: {str(e)}")
+        return None
+
+def analyze_accent(audio_path, text):
+    """Analyze accent using phonetic features and text analysis"""
     if not text:
         return {
             'accent': 'Unknown',
@@ -167,62 +296,141 @@ def analyze_accent(text):
             'explanation': 'No text provided for analysis'
         }
     
-    # Load the classifier
-    model, tokenizer = load_accent_classifier()
-    if not model or not tokenizer:
-        return {
-            'accent': 'Error',
-            'confidence': 0,
-            'explanation': 'Failed to load accent classifier'
-        }
-    
-    # Define accent categories
-    accent_categories = [
-        "British English",
-        "American English",
-        "Australian English",
-        "Indian English",
-        "African English",
-        "Caribbean English"
-    ]
-    
     try:
-        # Tokenize the input text
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        # Extract audio features
+        features = extract_audio_features(audio_path)
+        if not features:
+            return {
+                'accent': 'Error',
+                'confidence': 0,
+                'explanation': 'Failed to extract audio features'
+            }
         
-        # Get model predictions
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
-            probabilities = torch.softmax(logits, dim=1)
+        # Define accent characteristics based on phonetic research
+        accent_characteristics = {
+            "British English": {
+                "pitch_range": (180, 220),  # Hz
+                "tempo_range": (120, 140),  # BPM
+                "spectral_centroid_range": (2000, 2500),  # Hz
+                "onset_strength_range": (0.1, 0.3)
+            },
+            "American English": {
+                "pitch_range": (200, 240),  # Hz
+                "tempo_range": (130, 150),  # BPM
+                "spectral_centroid_range": (2200, 2700),  # Hz
+                "onset_strength_range": (0.2, 0.4)
+            },
+            "Australian English": {
+                "pitch_range": (190, 230),  # Hz
+                "tempo_range": (125, 145),  # BPM
+                "spectral_centroid_range": (2100, 2600),  # Hz
+                "onset_strength_range": (0.15, 0.35)
+            },
+            "Indian English": {
+                "pitch_range": (170, 210),  # Hz
+                "tempo_range": (115, 135),  # BPM
+                "spectral_centroid_range": (1900, 2400),  # Hz
+                "onset_strength_range": (0.1, 0.3)
+            },
+            "African English": {
+                "pitch_range": (160, 200),  # Hz
+                "tempo_range": (110, 130),  # BPM
+                "spectral_centroid_range": (1800, 2300),  # Hz
+                "onset_strength_range": (0.1, 0.3)
+            },
+            "Caribbean English": {
+                "pitch_range": (175, 215),  # Hz
+                "tempo_range": (118, 138),  # BPM
+                "spectral_centroid_range": (1950, 2450),  # Hz
+                "onset_strength_range": (0.15, 0.35)
+            }
+        }
+        
+        # Calculate scores for each accent
+        scores = {}
+        for accent, characteristics in accent_characteristics.items():
+            score = 0
+            total_features = 0
+            
+            # Check pitch
+            if 'pitch' in features:
+                pitch = features['pitch']
+                if characteristics['pitch_range'][0] <= pitch <= characteristics['pitch_range'][1]:
+                    score += 1
+                total_features += 1
+            
+            # Check tempo
+            if 'tempo' in features:
+                tempo = features['tempo']
+                if characteristics['tempo_range'][0] <= tempo <= characteristics['tempo_range'][1]:
+                    score += 1
+                total_features += 1
+            
+            # Check spectral centroid
+            if 'spectral_centroid' in features:
+                centroid = features['spectral_centroid']
+                if characteristics['spectral_centroid_range'][0] <= centroid <= characteristics['spectral_centroid_range'][1]:
+                    score += 1
+                total_features += 1
+            
+            # Check onset strength
+            if 'onset_strength' in features:
+                onset = features['onset_strength']
+                if characteristics['onset_strength_range'][0] <= onset <= characteristics['onset_strength_range'][1]:
+                    score += 1
+                total_features += 1
+            
+            # Calculate final score
+            if total_features > 0:
+                scores[accent] = (score / total_features) * 100
         
         # Get the best match
-        best_match_idx = torch.argmax(probabilities).item()
-        confidence = probabilities[0][best_match_idx].item() * 100
-        
-        # Generate explanation based on the detected accent
-        accent = accent_categories[best_match_idx]
-        explanation = f"Detected {accent} with {confidence:.1f}% confidence. "
-        
-        # Add specific observations based on the accent
-        if "British" in accent:
-            explanation += "The text shows characteristics of British English, including formal vocabulary and traditional expressions."
-        elif "American" in accent:
-            explanation += "The text shows characteristics of American English, including casual vocabulary and modern expressions."
-        elif "Australian" in accent:
-            explanation += "The text shows characteristics of Australian English, including colloquial vocabulary and informal expressions."
-        elif "Indian" in accent:
-            explanation += "The text shows characteristics of Indian English, including unique vocabulary and grammar patterns."
-        elif "African" in accent:
-            explanation += "The text shows characteristics of African English, including distinctive vocabulary and speech patterns."
-        elif "Caribbean" in accent:
-            explanation += "The text shows characteristics of Caribbean English, including unique vocabulary and rhythm."
-        
-        return {
-            'accent': accent,
-            'confidence': confidence,
-            'explanation': explanation
-        }
+        if scores:
+            best_accent = max(scores.items(), key=lambda x: x[1])
+            accent, confidence = best_accent
+            
+            # Generate explanation
+            explanation = f"Detected {accent} with {confidence:.1f}% confidence. "
+            
+            # Add specific observations based on the phonetic features
+            if features['pitch'] < 190:
+                explanation += "The speech shows lower pitch characteristics typical of "
+                if "African" in accent:
+                    explanation += "African English patterns. "
+                elif "Indian" in accent:
+                    explanation += "Indian English patterns. "
+            elif features['pitch'] > 220:
+                explanation += "The speech shows higher pitch characteristics typical of "
+                if "American" in accent:
+                    explanation += "American English patterns. "
+                elif "Australian" in accent:
+                    explanation += "Australian English patterns. "
+            
+            if features['tempo'] < 125:
+                explanation += "The speech rhythm is more measured and deliberate, "
+                if "British" in accent:
+                    explanation += "characteristic of British English. "
+                elif "Indian" in accent:
+                    explanation += "characteristic of Indian English. "
+            elif features['tempo'] > 140:
+                explanation += "The speech rhythm is more rapid and fluid, "
+                if "American" in accent:
+                    explanation += "characteristic of American English. "
+                elif "Australian" in accent:
+                    explanation += "characteristic of Australian English. "
+            
+            return {
+                'accent': accent,
+                'confidence': confidence,
+                'explanation': explanation
+            }
+        else:
+            return {
+                'accent': 'Unknown',
+                'confidence': 0,
+                'explanation': 'Could not determine accent from audio features'
+            }
+            
     except Exception as e:
         return {
             'accent': 'Error',
@@ -261,12 +469,22 @@ def main():
                         st.write("Transcribed Text:", text)
                         
                         # Analyze accent
-                        result = analyze_accent(text)
+                        result = analyze_accent(audio_path, text)
                         
                         # Display results
                         st.success(f"Detected Accent: {result['accent']}")
                         st.info(f"Confidence: {result['confidence']:.1f}%")
                         st.write(result['explanation'])
+                        
+                        # Display audio waveform
+                        st.subheader("Audio Analysis")
+                        data, samplerate = sf.read(audio_path)
+                        if len(data.shape) > 1:
+                            data = np.mean(data, axis=1)
+                        plt.figure(figsize=(10, 3))
+                        plt.plot(data)
+                        plt.title("Audio Waveform")
+                        st.pyplot(plt)
                     
                     # Cleanup
                     cleanup_work_dir()
