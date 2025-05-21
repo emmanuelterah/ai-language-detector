@@ -9,7 +9,7 @@ from collections import Counter
 from pydub import AudioSegment
 import subprocess
 import shutil
-from transformers import pipeline
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 
 # Create a directory for downloads and analysis
@@ -22,15 +22,13 @@ def load_accent_classifier():
     """Load the accent classification model"""
     try:
         # Using a simpler model that doesn't require custom classes
-        classifier = pipeline(
-            "zero-shot-classification",
-            model="facebook/bart-large-mnli",
-            device=0 if torch.cuda.is_available() else -1
-        )
-        return classifier
+        model_name = "distilbert-base-uncased"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=6)
+        return model, tokenizer
     except Exception as e:
         st.error(f"Error loading model: {str(e)}")
-        return None
+        return None, None
 
 def cleanup_work_dir():
     """Clean up the work directory"""
@@ -79,7 +77,15 @@ def download_video(url):
         'ignoreerrors': True,
         'no_warnings': False,
         'quiet': False,
-        'verbose': True
+        'verbose': True,
+        # Add YouTube authentication
+        'cookiesfrombrowser': ('chrome',),
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        }
     }
     
     try:
@@ -162,38 +168,40 @@ def analyze_accent(text):
         }
     
     # Load the classifier
-    classifier = load_accent_classifier()
-    if not classifier:
+    model, tokenizer = load_accent_classifier()
+    if not model or not tokenizer:
         return {
             'accent': 'Error',
             'confidence': 0,
             'explanation': 'Failed to load accent classifier'
         }
     
-    # Define accent categories with their characteristics
+    # Define accent categories
     accent_categories = [
-        "British English accent with formal vocabulary and traditional expressions",
-        "American English accent with casual vocabulary and modern expressions",
-        "Australian English accent with colloquial vocabulary and informal expressions",
-        "Indian English accent with unique vocabulary and grammar patterns",
-        "African English accent with distinctive vocabulary and speech patterns",
-        "Caribbean English accent with unique vocabulary and rhythm"
+        "British English",
+        "American English",
+        "Australian English",
+        "Indian English",
+        "African English",
+        "Caribbean English"
     ]
     
     try:
-        # Perform zero-shot classification
-        result = classifier(
-            text,
-            accent_categories,
-            multi_label=False
-        )
+        # Tokenize the input text
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        
+        # Get model predictions
+        with torch.no_grad():
+            outputs = model(**inputs)
+            logits = outputs.logits
+            probabilities = torch.softmax(logits, dim=1)
         
         # Get the best match
-        best_match_idx = result['labels'].index(result['labels'][0])
-        confidence = result['scores'][0] * 100
+        best_match_idx = torch.argmax(probabilities).item()
+        confidence = probabilities[0][best_match_idx].item() * 100
         
         # Generate explanation based on the detected accent
-        accent = result['labels'][0]
+        accent = accent_categories[best_match_idx]
         explanation = f"Detected {accent} with {confidence:.1f}% confidence. "
         
         # Add specific observations based on the accent
